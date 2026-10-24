@@ -6,7 +6,7 @@ keba-kecontact 1.3.0, including behaviour that looks wrong. Tests named
 """
 
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from freezegun.api import FrozenDateTimeFactory
 import pytest
@@ -71,17 +71,30 @@ async def test_setup_applies_configured_failsafe(
     assert setup_keba.commands == ["failsafe 60 10000 1"]
 
 
-async def test_setup_failsafe_out_of_range_currently_unchecked(
-    hass: HomeAssistant, station: FakeKebaStation
+async def test_setup_failsafe_out_of_range_currently_unhandled(
+    hass: HomeAssistant, station: FakeKebaStation, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Test an out-of-range failsafe timeout is passed on unchecked.
+    """Test an out-of-range failsafe timeout fails in the background, unseen.
 
     The integration starts set_failsafe in a task and does not validate the
-    timeout itself. The library rejects 5 with ValueError, but inside that
-    task, so the try/except around starting it never sees the error, and no
+    timeout itself. The library rejects 5 with ValueError inside that task,
+    so the try/except around starting it never sees the error, and no
     failsafe command is sent.
     """
-    with patch.object(KebaHandler, "set_failsafe") as set_failsafe:
+    errors: list[ValueError] = []
+    library_set_failsafe = KebaHandler.set_failsafe
+
+    async def set_failsafe(keba: KebaHandler, *args: Any) -> None:
+        # Keep the task's error out of the test harness, which fails the
+        # test on any unretrieved task exception.
+        try:
+            await library_set_failsafe(keba, *args)
+        except ValueError as err:
+            errors.append(err)
+
+    with patch.object(
+        KebaHandler, "set_failsafe", autospec=True, side_effect=set_failsafe
+    ) as mock_set_failsafe:
         assert await async_setup_component(
             hass,
             DOMAIN,
@@ -89,7 +102,11 @@ async def test_setup_failsafe_out_of_range_currently_unchecked(
         )
         await async_settle(hass)
 
-    set_failsafe.assert_awaited_once_with(5, 6, 0)
+    mock_set_failsafe.assert_awaited_once_with(ANY, 5, 6, 0)
+    assert len(errors) == 1
+    assert str(errors[0]).startswith("Failsafe timeout must be between")
+    assert station.commands == []
+    assert "Could not set failsafe mode" not in caplog.text
 
     await stop_polling(hass)
 
